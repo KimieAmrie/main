@@ -49,12 +49,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             $hashed = password_hash($data['password'], PASSWORD_DEFAULT);
             $dob = $data['date_of_birth'] ?: null;
-            $stmt = $conn->prepare("INSERT INTO users (full_name, username, email, phone, date_of_birth, role, password, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')");
+            $stmt = $conn->prepare("INSERT INTO users (full_name, username, email, phone, date_of_birth, role, password, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')");
             $stmt->bind_param("sssssss", $data['full_name'], $data['username'], $data['email'], $data['phone'], $dob, $data['role'], $hashed);
 
             if ($stmt->execute()) {
-                $success = 'Pendaftaran berjaya! Akaun anda sedang menunggu kelulusan pentadbir. Sila log masuk setelah diluluskan.';
-                $data = [];
+                // Auto login terus selepas sign up
+                $new_user_id = $conn->insert_id;
+                $_SESSION['user_id']   = $new_user_id;
+                $_SESSION['full_name'] = $data['full_name'];
+                $_SESSION['role']      = $data['role'];
+
+                // Redirect ke dashboard berdasarkan role
+                $dest = match($data['role']) {
+                    'student'  => 'student_dashboard.php',
+                    'staff'    => 'staff_dashboard.php',
+                    'lecturer' => 'lect_dashboard.php',
+                    'admin'    => 'admin_dashboard.php',
+                    default    => 'login_page.php',
+                };
+                header("Location: " . $dest);
+                exit();
             } else {
                 $error = 'Ralat semasa pendaftaran. Sila cuba lagi.';
             }

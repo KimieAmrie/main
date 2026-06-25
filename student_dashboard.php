@@ -24,6 +24,101 @@ $student = $stmt->get_result()->fetch_assoc();
 // ── Handle Apply Course ───────────────────────────
 $msg = $msg_type = '';
 
+// ========================================
+// ADD SUBJECT
+// ========================================
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST'
+    && isset($_POST['action'])
+    && $_POST['action'] === 'add_subject'
+) {
+
+    $subject_id = intval($_POST['subject_id']);
+
+    $check = $conn->prepare("
+        SELECT ss_id
+        FROM student_subjects
+        WHERE user_id=?
+        AND subject_id=?
+        AND status='active'
+    ");
+
+    $check->bind_param("ii", $user_id, $subject_id);
+    $check->execute();
+
+    if ($check->get_result()->num_rows > 0) {
+
+        $msg = "Subject already added.";
+        $msg_type = "warning";
+
+    } else {
+
+        $insert = $conn->prepare("
+            INSERT INTO student_subjects
+            (
+                user_id,
+                subject_id,
+                status,
+                assigned_at
+            )
+            VALUES
+            (
+                ?,
+                ?,
+                'active',
+                NOW()
+            )
+        ");
+
+        $insert->bind_param("ii", $user_id, $subject_id);
+
+        if ($insert->execute()) {
+
+            $msg = "Subject added successfully.";
+            $msg_type = "success";
+
+        } else {
+
+            $msg = "Failed to add subject.";
+            $msg_type = "error";
+        }
+    }
+}
+
+// ========================================
+// DROP SUBJECT HANDLER
+// ========================================
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST'
+    && isset($_POST['action'])
+    && $_POST['action'] === 'drop_subject'
+) {
+    // 1. Ambil kod subjek (berbentuk String/Teks, jangan guna intval)
+    $subject_code = trim($_POST['subject_code']);
+
+    // 2. Gunakan subquery di dalam DELETE untuk tukarkan kod subjek kepada ID dalam database
+    $drop_stmt = $conn->prepare("
+        DELETE FROM student_subjects 
+        WHERE user_id = ? 
+          AND status = 'active'
+          AND subject_id = (SELECT subject_id FROM subjects WHERE subject_code = ? LIMIT 1)
+    ");
+    
+    // "is" bermaksud integer untuk user_id, string untuk subject_code
+    $drop_stmt->bind_param("is", $user_id, $subject_code);
+
+    if ($drop_stmt->execute()) {
+        $msg = "Subjek berjaya digugurkan (dropped).";
+        $msg_type = "success";
+    } else {
+        $msg = "Gagal untuk menggugurkan subjek.";
+        $msg_type = "error";
+    }
+    
+    // Segarkan data dan kembali ke tab manage_subjects
+    header("Location: student_dashboard.php?tab=manage_subjects");
+    exit();
+}
 // ── Update Profile (Tarikh Lahir, Telefon) ────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'update_profile') {
     $phone = trim($_POST['phone']);
@@ -68,14 +163,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['apply_course_id'])) {
     $course_id = intval($_POST['apply_course_id']);
     $semester  = '2024/2025-1';
 
-    // Check already applied
-    $chk = $conn->prepare("SELECT reg_id FROM course_registrations WHERE user_id=? AND course_id=? AND semester=?");
+    // Sekat pemohonan jika pelajar sudah mempunyai kursus yang diluluskan
+    $chk_has_course = $conn->prepare("SELECT COUNT(*) AS c FROM course_registrations WHERE user_id=? AND status='approved'");
+    $chk_has_course->bind_param("i", $user_id);
+    $chk_has_course->execute();
+    $already_has_approved_course = $chk_has_course->get_result()->fetch_assoc()['c'] > 0;
+
+    // Check if already applied with active status (pending or approved only)
+    // dropped and rejected = boleh mohon semula
+    $chk = $conn->prepare("SELECT reg_id, status FROM course_registrations WHERE user_id=? AND course_id=? AND semester=? AND status IN ('pending','approved')");
     $chk->bind_param("iis", $user_id, $course_id, $semester);
     $chk->execute();
-    $chk->store_result();
+    $chk_result = $chk->get_result()->fetch_assoc();
 
-    if ($chk->num_rows > 0) {
-        $msg = 'Anda sudah memohon kursus ini.';
+    if ($already_has_approved_course) {
+        $msg = 'Anda sudah mempunyai kursus yang telah diluluskan. Anda tidak boleh memohon kursus lain.';
+        $msg_type = 'warning';
+    } elseif ($chk_result) {
+        if ($chk_result['status'] === 'pending') {
+            $msg = 'Anda sudah mempunyai permohonan yang sedang menunggu kelulusan untuk kursus ini.';
+        } else {
+            $msg = 'Anda sudah berdaftar dalam kursus ini.';
+        }
         $msg_type = 'warning';
     } else {
         // Check course still open
@@ -88,10 +197,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['apply_course_id'])) {
             $msg = 'Kursus ini sudah ditutup atau penuh.';
             $msg_type = 'error';
         } else {
-            $ins = $conn->prepare("INSERT INTO course_registrations (user_id, course_id, semester, status) VALUES (?,?,?,'pending')");
-            $ins->bind_param("iis", $user_id, $course_id, $semester);
-            if ($ins->execute()) {
-                $msg = 'Permohonan kursus berjaya dihantar! Sila tunggu kelulusan.';
+            // Check if old dropped/rejected record exists — UPDATE instead of INSERT
+            $old = $conn->prepare("SELECT reg_id FROM course_registrations WHERE user_id=? AND course_id=? AND semester=? AND status IN ('dropped','rejected')");
+            $old->bind_param("iis", $user_id, $course_id, $semester);
+            $old->execute();
+            $old_rec = $old->get_result()->fetch_assoc();
+
+            if ($old_rec) {
+                // Reuse existing record — just update status back to pending
+                $upd = $conn->prepare("UPDATE course_registrations SET status='pending', applied_at=NOW() WHERE reg_id=?");
+                $upd->bind_param("i", $old_rec['reg_id']);
+                $success = $upd->execute();
+            } else {
+                // Insert new record
+                $ins = $conn->prepare("INSERT INTO course_registrations (user_id, course_id, semester, status) VALUES (?,?,?,'pending')");
+                $ins->bind_param("iis", $user_id, $course_id, $semester);
+                $success = $ins->execute();
+            }
+
+            if ($success) {
+                $msg = 'Permohonan kursus berjaya dihantar! Sila tunggu kelulusan staf.';
                 $msg_type = 'success';
             } else {
                 $msg = 'Ralat berlaku. Sila cuba lagi.';
@@ -140,11 +265,15 @@ $avail_q = $conn->prepare("
         (SELECT COUNT(*) FROM course_registrations cr2
          WHERE cr2.course_id = c.course_id AND cr2.status IN ('pending','approved')) AS enrolled_count,
         (SELECT COUNT(*) FROM course_registrations cr3
-         WHERE cr3.course_id = c.course_id AND cr3.user_id = ? AND cr3.semester = c.semester) AS already_applied
+         WHERE cr3.course_id = c.course_id AND cr3.user_id = ? AND cr3.semester = c.semester
+         AND cr3.status IN ('pending','approved')) AS already_applied,
+        (SELECT status FROM course_registrations cr4
+         WHERE cr4.course_id = c.course_id AND cr4.user_id = ?
+         ORDER BY cr4.applied_at DESC LIMIT 1) AS prev_status
     FROM courses c
     ORDER BY c.faculty, c.course_code
 ");
-$avail_q->bind_param("i", $user_id);
+$avail_q->bind_param("ii", $user_id, $user_id);
 $avail_q->execute();
 $avail_courses = $avail_q->get_result()->fetch_all(MYSQLI_ASSOC);
 
@@ -152,7 +281,85 @@ $avail_courses = $avail_q->get_result()->fetch_all(MYSQLI_ASSOC);
 $total_applied  = count($my_courses);
 $total_approved = count(array_filter($my_courses, fn($r) => $r['status'] === 'approved'));
 $total_pending  = count(array_filter($my_courses, fn($r) => $r['status'] === 'pending'));
-$total_credits  = $total_approved; // Jumlah kursus diluluskan (kredit digugurkan, guna taraf pendidikan sekarang)
+$total_credits  = $total_approved;
+
+// ── Data: My Subjects (via student_subjects) ──────
+$my_subjects_q = $conn->prepare("
+    SELECT ss.ss_id, ss.status AS enrol_status, ss.assigned_at,
+           s.subject_code, s.subject_name, s.semester_no, s.credit_hours,
+           c.course_code, c.course_name,
+           cl.class_code, cl.class_name,
+           u.full_name AS lecturer_name
+    FROM student_subjects ss
+    JOIN subjects s  ON ss.subject_id = s.subject_id
+    JOIN courses  c  ON s.course_id   = c.course_id
+    LEFT JOIN classes cl ON ss.class_id = cl.class_id
+    LEFT JOIN class_lecturers clec ON clec.class_id = ss.class_id AND clec.subject_id = ss.subject_id
+    LEFT JOIN users u ON clec.lecturer_id = u.user_id
+    WHERE ss.user_id = ? AND ss.status = 'active'
+    ORDER BY s.semester_no, c.course_code, s.subject_code
+");
+$my_subjects_q->bind_param("i", $user_id);
+$my_subjects_q->execute();
+$my_subjects = $my_subjects_q->get_result()->fetch_all(MYSQLI_ASSOC);
+
+// ========================================
+// AVAILABLE SUBJECTS
+// ========================================
+$current_semester = intval($student['current_semester'] ?? 1);
+
+// Jika dalam DB bernilai 0, kita beri default sem 1 untuk paparan
+if ($current_semester <= 0) {
+    $current_semester = 1;
+}
+
+$available_subjects_q = $conn->prepare("
+    SELECT
+        s.*,
+        c.course_code,
+        c.course_name,
+        (
+            SELECT COUNT(*)
+            FROM student_subjects ss
+            WHERE ss.subject_id = s.subject_id
+              AND ss.user_id = ?
+              AND ss.status = 'active'
+        ) AS already_added
+    FROM subjects s
+    INNER JOIN courses c
+        ON c.course_id = s.course_id
+    WHERE s.status = 'active'
+      AND s.semester_no = ?
+    ORDER BY s.subject_code
+");
+
+$available_subjects_q->bind_param(
+    "ii",
+    $user_id,
+    $current_semester
+);
+
+$available_subjects_q->execute();
+$available_subjects = $available_subjects_q->get_result()->fetch_all(MYSQLI_ASSOC);
+
+// ── Data: My Classes (via class_students) ─────────
+$my_class_q = $conn->prepare("
+    SELECT cl.class_id, cl.class_code, cl.class_name,
+           cl.education_level, cl.semester_no, cl.section_num, cl.max_students, cl.status,
+           c.course_code, c.course_name,
+           (SELECT COUNT(*) FROM class_students cs2 WHERE cs2.class_id = cl.class_id) AS total_students,
+           (SELECT GROUP_CONCAT(DISTINCT u2.full_name ORDER BY u2.full_name SEPARATOR ', ')
+            FROM class_lecturers clec2 JOIN users u2 ON clec2.lecturer_id = u2.user_id
+            WHERE clec2.class_id = cl.class_id) AS lecturers
+    FROM class_students cs
+    JOIN classes cl ON cs.class_id = cl.class_id
+    JOIN courses  c ON cl.course_id = c.course_id
+    WHERE cs.user_id = ?
+    ORDER BY c.course_code, cl.class_code
+");
+$my_class_q->bind_param("i", $user_id);
+$my_class_q->execute();
+$my_classes = $my_class_q->get_result()->fetch_all(MYSQLI_ASSOC);
 
 // Status badge helper
 function statusBadge($status) {
@@ -444,6 +651,13 @@ function statusBadge($status) {
         <a href="?tab=overview"      class="nav-item <?= $tab==='overview'      ? 'active':'' ?>"><i class="fas fa-house"></i> Gambaran Keseluruhan</a>
         <a href="?tab=profile"       class="nav-item <?= $tab==='profile'       ? 'active':'' ?>"><i class="fas fa-user"></i> Profil Saya</a>
 
+        <div class="nav-label">Akademik</div>
+        <a href="?tab=my_subjects"   class="nav-item <?= $tab==='my_subjects'   ? 'active':'' ?>"><i class="fas fa-bookmark"></i> Subjek Saya</a>
+        <a href="?tab=manage_subjects" class="nav-item <?= $tab==='manage_subjects' ? 'active':'' ?>">
+    <i class="fas fa-plus-minus"></i> Add / Drop Subject
+</a>
+        <a href="?tab=my_class"      class="nav-item <?= $tab==='my_class'      ? 'active':'' ?>"><i class="fas fa-chalkboard"></i> Kelas Saya</a>
+
         <div class="nav-label">Kursus</div>
         <a href="?tab=view_courses"  class="nav-item <?= $tab==='view_courses'  ? 'active':'' ?>"><i class="fas fa-book-open"></i> Senarai Kursus</a>
         <a href="?tab=apply_course"  class="nav-item <?= $tab==='apply_course'  ? 'active':'' ?>"><i class="fas fa-plus-circle"></i> Mohon Kursus</a>
@@ -469,6 +683,8 @@ function statusBadge($status) {
                 $titles = [
                     'overview'    => 'Gambaran Keseluruhan',
                     'profile'     => 'Profil Saya',
+                    'my_subjects' => 'Subjek Saya',
+                    'my_class'    => 'Kelas Saya',
                     'view_courses'=> 'Senarai Kursus Tersedia',
                     'apply_course'=> 'Mohon Kursus',
                     'my_courses'  => 'Kursus Saya',
@@ -620,6 +836,7 @@ function statusBadge($status) {
                     <div class="profile-field"><label>Taraf Pendidikan</label><div class="val <?= !$student['education_level']?'empty':'' ?>"><?= $student['education_level'] ? ucfirst($student['education_level']) : 'Belum ditetapkan' ?></div></div>
                     <div class="profile-field"><label>Fakulti</label><div class="val <?= !$student['faculty']?'empty':'' ?>"><?= $student['faculty'] ?: 'Belum ditetapkan' ?></div></div>
                     <div class="profile-field"><label>Program Pengajian</label><div class="val <?= !$student['program']?'empty':'' ?>"><?= $student['program'] ?: 'Belum ditetapkan' ?></div></div>
+                    <div class="profile-field"><label>Tahun Pengajian</label><div class="val <?= !$student['year_of_study']?'empty':'' ?>"><?= $student['year_of_study'] ? 'Tahun '.$student['year_of_study'] : 'Belum ditetapkan' ?></div></div>
                 </div>
                 <div style="margin-top:16px;padding:12px 16px;background:var(--blue-pale);border-radius:10px;font-size:13px;color:var(--blue-mid)">
                     <i class="fas fa-circle-info" style="margin-right:8px"></i>
@@ -655,6 +872,209 @@ function statusBadge($status) {
                 </form>
             </div>
         </div>
+
+        <!-- ══ TAB: MY SUBJECTS ══ -->
+        <?php elseif ($tab === 'my_subjects'): ?>
+        <div class="card">
+            <div class="card-header">
+                <div><h3>📖 Subjek Saya</h3><p>Senarai subjek yang anda akan pelajari semester ini</p></div>
+                <span class="badge badge-blue"><?= count($my_subjects) ?> subjek</span>
+            </div>
+            <?php if ($my_subjects): ?>
+            <table>
+                <thead>
+                    <tr><th>#</th><th>Kod Subjek</th><th>Nama Subjek</th><th>Kursus</th><th>Semester</th><th>Kredit</th><th>Kelas</th><th>Pensyarah</th><th>Status</th><th>Tindakan</th></tr>
+                </thead>
+                <tbody>
+                <?php foreach ($my_subjects as $i => $s): ?>
+<tr>
+    <td style="color:var(--gray-300)"><?= $i+1 ?></td>
+    <td><span class="badge badge-blue"><?= htmlspecialchars($s['subject_code']) ?></span></td>
+    <td><strong><?= htmlspecialchars($s['subject_name']) ?></strong></td>
+    <td><span class="badge badge-gray"><?= htmlspecialchars($s['course_code']) ?></span></td>
+    <td><?= $s['semester_no'] ? '<span class="badge badge-warning">Sem '.$s['semester_no'].'</span>' : '—' ?></td>
+    <td style="text-align:center"><?= $s['credit_hours'] ?> Kredit</td>
+    <td><?= $s['class_code'] ? '<span class="badge badge-success" style="font-family:monospace">'.htmlspecialchars($s['class_code']).'</span>' : '<span style="color:var(--gray-300)">—</span>' ?></td>
+    <td style="font-size:12px"><?= $s['lecturer_name'] ? htmlspecialchars($s['lecturer_name']) : '<span style="color:var(--gray-300)">Belum ditetapkan</span>' ?></td>
+    <td><span class="badge badge-success"><?= htmlspecialchars($s['enrol_status']) ?> </span> </td>
+     <td>
+    <form method="POST" onsubmit="return confirm('Adakah anda ingin drop subjek tersebut?');" style="margin:0;">
+        <input type="hidden" name="action" value="drop_subject">
+        <input type="hidden" name="subject_code" value="<?= htmlspecialchars($s['subject_code']) ?>">            
+        <button type="submit" class="btn btn-danger btn-sm" style="padding: 5px 10px;">
+            Drop
+        </button>
+    </form> 
+</td>
+    </tr>
+    <?php endforeach; ?>
+                </tbody>
+            </table>
+            <?php else: ?>
+            <div class="empty-state">
+                <div class="icon">📖</div>
+                <h4>Tiada subjek lagi</h4>
+                <p>Subjek anda belum diassign oleh staf. Sila hubungi pejabat akademik.</p>
+            </div>
+            <?php endif; ?>
+        </div>
+
+       <?php elseif ($tab === 'manage_subjects'): ?>
+
+<div class="card">
+
+    <div class="card-header">
+        <div>
+            <h3>➕ Add / Drop Subject</h3>
+            <p>
+                Semester <?= htmlspecialchars($current_semester) ?> 
+                Subject Registration
+            </p>
+        </div>
+    </div>
+
+    <div style="padding: 20px;">
+
+        <input
+            type="text"
+            id="subjectSearch"
+            placeholder="Search subject..."
+            style="
+                width: 100%;
+                padding: 12px;
+                margin-bottom: 15px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+            "
+        >
+
+        <table id="subjectTable" class="table">
+            <thead>
+                <tr>
+                    <th>Code</th>
+                    <th>Subject</th>
+                    <th>Semester</th>
+                    <th>Credit</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+
+            <tbody>
+                <?php if (!empty($available_subjects)): ?>
+                    <?php foreach ($available_subjects as $s): ?>
+                        <tr>
+                            <td>
+                                <?= htmlspecialchars($s['subject_code']) ?>
+                            </td>
+                            <td>
+                                <?= htmlspecialchars($s['subject_name']) ?>
+                            </td>
+                            <td>
+                                Semester <?= htmlspecialchars($s['semester_no']) ?>
+                            </td>
+                            <td>
+                                <?= htmlspecialchars($s['credit_hours']) ?>
+                            </td>
+                            <td>
+                                <?php if ($s['already_added'] > 0): ?>
+                                    <span class="badge badge-success">
+                                        Added
+                                    </span>
+                                <?php else: ?>
+                                    <form method="POST" style="margin: 0;">
+                                        <input
+                                            type="hidden"
+                                            name="action"
+                                            value="add_subject"
+                                        >
+                                        <input
+                                            type="hidden"
+                                            name="subject_id"
+                                            value="<?= htmlspecialchars($s['subject_id']) ?>"
+                                        >
+                                        <button
+                                            class="btn btn-primary"
+                                            type="submit"
+                                        >
+                                            Add
+                                        </button>
+                                    </form>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <tr>
+                        <td colspan="5" style="text-align: center; padding: 20px; color: #777;">
+                            No subjects available for this semester.
+                        </td>
+                    </tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+
+    </div>
+
+</div>
+
+        <!-- ══ TAB: MY CLASS ══ -->
+        <?php elseif ($tab === 'my_class'): ?>
+        <?php if ($my_classes): ?>
+            <?php foreach ($my_classes as $cl):
+                $edu = $cl['education_level'] ?? '';
+                $edu_label = match($edu) { 'asasi'=>'Asasi','diploma'=>'Diploma', default=>'—' };
+                $edu_badge = match($edu) { 'asasi'=>'badge-warning','diploma'=>'badge-blue', default=>'badge-gray' };
+            ?>
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <h3><span style="font-family:monospace;color:var(--blue-bright)"><?= htmlspecialchars($cl['class_code']) ?></span> &nbsp;·&nbsp; <?= htmlspecialchars($cl['class_name']) ?></h3>
+                        <p>Kursus: <?= htmlspecialchars($cl['course_code'].' — '.$cl['course_name']) ?></p>
+                    </div>
+                    <span class="badge <?= $cl['status']==='active'?'badge-success':'badge-gray' ?>"><?= $cl['status']==='active'?'Aktif':'Tidak Aktif' ?></span>
+                </div>
+                <div class="card-body">
+                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px">
+                        <div>
+                            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--gray-500);margin-bottom:5px">Taraf Pendidikan</div>
+                            <span class="badge <?= $edu_badge ?>"><?= $edu_label ?></span>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--gray-500);margin-bottom:5px">Semester</div>
+                            <span class="badge badge-warning"><?= $cl['semester_no'] ? 'Semester '.$cl['semester_no'] : '—' ?></span>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--gray-500);margin-bottom:5px">No. Section</div>
+                            <span style="font-size:14px;font-weight:700;color:var(--gray-900)"><?= $cl['section_num'] ? 'Section '.str_pad($cl['section_num'],2,'0',STR_PAD_LEFT) : '—' ?></span>
+                        </div>
+                        <div>
+                            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--gray-500);margin-bottom:5px">Bilangan Pelajar</div>
+                            <span style="font-size:14px;font-weight:700;color:var(--gray-900)"><?= $cl['total_students'] ?>/<?= $cl['max_students'] ?></span>
+                        </div>
+                    </div>
+                    <?php if ($cl['lecturers']): ?>
+                    <div style="margin-top:16px;padding:12px 16px;background:var(--blue-pale);border-radius:10px;font-size:13px;color:var(--blue-mid)">
+                        <i class="fas fa-chalkboard-user" style="margin-right:8px"></i>
+                        <strong>Pensyarah:</strong> <?= htmlspecialchars($cl['lecturers']) ?>
+                    </div>
+                    <?php else: ?>
+                    <div style="margin-top:16px;padding:12px 16px;background:var(--gray-50);border-radius:10px;font-size:13px;color:var(--gray-300)">
+                        <i class="fas fa-circle-info" style="margin-right:8px"></i>
+                        Pensyarah belum ditetapkan untuk kelas ini.
+                    </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        <?php else: ?>
+        <div class="card">
+            <div class="empty-state">
+                <div class="icon">🏫</div>
+                <h4>Tiada kelas lagi</h4>
+                <p>Anda belum dimasukkan ke dalam mana-mana kelas. Sila hubungi pejabat akademik.</p>
+            </div>
+        </div>
+        <?php endif; ?>
 
         <!-- ══ TAB: VIEW COURSES ══ -->
         <?php elseif ($tab === 'view_courses'): ?>
@@ -696,6 +1116,15 @@ function statusBadge($status) {
 
         <!-- ══ TAB: APPLY COURSE ══ -->
         <?php elseif ($tab === 'apply_course'): ?>
+        <?php if ($total_approved > 0): ?>
+        <div style="background:linear-gradient(135deg,#dbeafe,#eff6ff);border:1px solid #bfdbfe;border-radius:12px;padding:16px 20px;margin-bottom:20px;display:flex;align-items:center;gap:14px">
+            <span style="font-size:26px">✅</span>
+            <div>
+                <div style="font-size:15px;font-weight:700;color:var(--blue-mid)">Anda sudah mempunyai kursus yang diluluskan</div>
+                <div style="font-size:13px;color:var(--blue-mid);margin-top:2px">Anda tidak boleh memohon kursus lain selagi sudah ada kursus berdaftar. Sila rujuk tab "Kursus Saya".</div>
+            </div>
+        </div>
+        <?php endif; ?>
         <div class="search-wrap">
             <i class="fas fa-search"></i>
             <input type="text" id="searchApply" placeholder="Cari kursus untuk mohon..." oninput="filterApply()">
@@ -703,12 +1132,21 @@ function statusBadge($status) {
         <div class="course-grid" id="applyGrid">
             <?php foreach ($avail_courses as $c): ?>
             <?php if ($c['status'] === 'open'): ?>
-            <div class="course-card <?= $c['already_applied']?'applied':'' ?>"
+            <?php
+                $prev = $c['prev_status'] ?? null;
+                $can_reapply = in_array($prev, ['dropped','rejected']) && $total_approved === 0;
+                $is_applied  = $c['already_applied'] > 0;
+            ?>
+            <div class="course-card <?= $is_applied ? 'applied' : ($can_reapply ? '' : '') ?>"
                  data-search="<?= strtolower($c['course_code'].' '.$c['course_name']) ?>">
                 <div class="cc-header">
                     <span class="cc-code"><?= htmlspecialchars($c['course_code']) ?></span>
-                    <?php if ($c['already_applied']): ?>
-                        <span class="badge badge-success">✓ Dah Mohon</span>
+                    <?php if ($is_applied): ?>
+                        <span class="badge badge-success">✓ Dalam Proses</span>
+                    <?php elseif ($prev === 'rejected'): ?>
+                        <span class="badge badge-danger">✗ Ditolak</span>
+                    <?php elseif ($prev === 'dropped'): ?>
+                        <span class="badge badge-gray">Dibatalkan</span>
                     <?php else: ?>
                         <span class="badge badge-success">Dibuka</span>
                     <?php endif; ?>
@@ -721,12 +1159,23 @@ function statusBadge($status) {
                     <span><i class="fas fa-building-columns"></i> <?= htmlspecialchars($c['faculty']) ?></span>
                 </div>
                 <div class="cc-footer">
-                    <?php if ($c['already_applied']): ?>
+                    <?php if ($is_applied): ?>
                         <button class="btn btn-sm" disabled style="width:100%;justify-content:center;background:var(--green-50);color:var(--green-700);border:1px solid #bbf7d0">
-                            <i class="fas fa-check"></i> Sudah Dipohon
+                            <i class="fas fa-check"></i> Sudah Dipohon / Menunggu Kelulusan
                         </button>
+                    <?php elseif ($total_approved > 0): ?>
+                        <button class="btn btn-sm" disabled style="width:100%;justify-content:center;background:var(--gray-100);color:var(--gray-300)">
+                            <i class="fas fa-lock"></i> Sudah Mempunyai Kursus
+                        </button>
+                    <?php elseif ($can_reapply): ?>
+                        <form method="POST" style="margin:0" onsubmit="return confirm('Anda pasti mahu mohon semula kursus <?= htmlspecialchars($c['course_name'],ENT_QUOTES) ?> (<?= htmlspecialchars($c['course_code'],ENT_QUOTES) ?>)?')">
+                            <input type="hidden" name="apply_course_id" value="<?= $c['course_id'] ?>">
+                            <button type="submit" class="btn btn-sm" style="width:100%;justify-content:center;background:var(--yellow-50);color:var(--yellow-700);border:1px solid #fde68a">
+                                <i class="fas fa-rotate-right"></i> Mohon Semula
+                            </button>
+                        </form>
                     <?php else: ?>
-                        <form method="POST" style="margin:0">
+                        <form method="POST" style="margin:0" onsubmit="return confirm('Anda pasti mahu mohon kursus <?= htmlspecialchars($c['course_name'],ENT_QUOTES) ?> (<?= htmlspecialchars($c['course_code'],ENT_QUOTES) ?>)?')">
                             <input type="hidden" name="apply_course_id" value="<?= $c['course_id'] ?>">
                             <button type="submit" class="btn btn-primary btn-sm" style="width:100%;justify-content:center">
                                 <i class="fas fa-plus"></i> Mohon Kursus Ini
@@ -857,6 +1306,34 @@ function validateStudentPwForm() {
     }
     return true;
 }
+
+
+document
+.getElementById("subjectSearch")
+.addEventListener("keyup", function() {
+
+    let value =
+        this.value.toLowerCase();
+
+    let rows =
+        document.querySelectorAll(
+            "#subjectTable tbody tr"
+        );
+
+    rows.forEach(function(row){
+
+        let text =
+            row.innerText.toLowerCase();
+
+        row.style.display =
+            text.includes(value)
+            ? ""
+            : "none";
+
+    });
+
+});
+
 </script>
 </body>
 </html>
